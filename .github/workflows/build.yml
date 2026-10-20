@@ -1,0 +1,476 @@
+name: Build Jarvis
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Criar projeto
+        run: |
+          mkdir -p app/src/main/java/com/jarvis/app/ai app/src/main/java/com/jarvis/app/data
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Jarvis"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.jarvis.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.jarvis.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.security:security-crypto:1.1.0-alpha06")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Jarvis"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/jarvis/app/ai/AiProvider.kt <<'EOF'
+          package com.jarvis.app.ai
+
+          data class ChatTurn(val fromUser: Boolean, val text: String)
+
+          class AiException(message: String) : Exception(message)
+
+          interface AiProvider {
+              fun reply(history: List<ChatTurn>): String
+          }
+          EOF
+
+          cat > app/src/main/java/com/jarvis/app/ai/GeminiProvider.kt <<'EOF'
+          package com.jarvis.app.ai
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class GeminiProvider(
+              private val apiKey: String,
+              private val model: String,
+              private val systemPrompt: String
+          ) : AiProvider {
+
+              override fun reply(history: List<ChatTurn>): String {
+                  val contents = JSONArray()
+                  for (turn in history) {
+                      val part = JSONObject().put("text", turn.text)
+                      contents.put(
+                          JSONObject()
+                              .put("role", if (turn.fromUser) "user" else "model")
+                              .put("parts", JSONArray().put(part))
+                      )
+                  }
+                  val system = JSONObject().put(
+                      "parts",
+                      JSONArray().put(JSONObject().put("text", systemPrompt))
+                  )
+                  val body = JSONObject()
+                      .put("contents", contents)
+                      .put("systemInstruction", system)
+
+                  val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+                  val conn = url.openConnection() as HttpURLConnection
+                  try {
+                      conn.requestMethod = "POST"
+                      conn.connectTimeout = 15000
+                      conn.readTimeout = 60000
+                      conn.doOutput = true
+                      conn.setRequestProperty("Content-Type", "application/json")
+                      conn.setRequestProperty("x-goog-api-key", apiKey)
+                      conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+                      val code = conn.responseCode
+                      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                      val raw = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                      if (code !in 200..299) throw AiException(explain(code))
+
+                      val parts = JSONObject(raw)
+                          .getJSONArray("candidates")
+                          .getJSONObject(0)
+                          .getJSONObject("content")
+                          .getJSONArray("parts")
+                      val sb = StringBuilder()
+                      for (i in 0 until parts.length()) {
+                          sb.append(parts.getJSONObject(i).optString("text"))
+                      }
+                      val text = sb.toString().trim()
+                      if (text.isEmpty()) throw AiException("A IA não devolveu texto.")
+                      return text
+                  } finally {
+                      conn.disconnect()
+                  }
+              }
+
+              private fun explain(code: Int): String = when (code) {
+                  400 -> "Pedido recusado (400). Confira a chave e o nome do modelo em Ajustes."
+                  401, 403 -> "Chave recusada ($code). Confira a chave em Ajustes."
+                  404 -> "Modelo não encontrado (404). Troque o nome do modelo em Ajustes."
+                  429 -> "Limite gratuito atingido (429). Espere um pouco e tente de novo."
+                  else -> "Erro $code no servidor de IA."
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/jarvis/app/data/SecureStore.kt <<'EOF'
+          package com.jarvis.app.data
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import androidx.security.crypto.EncryptedSharedPreferences
+          import androidx.security.crypto.MasterKey
+
+          class SecureStore(context: Context) {
+
+              private val prefs: SharedPreferences = EncryptedSharedPreferences.create(
+                  context,
+                  "jarvis_secure",
+                  MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+                  EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                  EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+              )
+
+              var apiKey: String
+                  get() = prefs.getString("api_key", "") ?: ""
+                  set(value) {
+                      prefs.edit().putString("api_key", value.trim()).apply()
+                  }
+
+              var model: String
+                  get() = prefs.getString("model", DEFAULT_MODEL) ?: DEFAULT_MODEL
+                  set(value) {
+                      prefs.edit().putString("model", value.trim().ifEmpty { DEFAULT_MODEL }).apply()
+                  }
+
+              companion object {
+                  const val DEFAULT_MODEL = "gemini-2.5-flash"
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/jarvis/app/MainActivity.kt <<'EOF'
+          package com.jarvis.app
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.inputmethod.EditorInfo
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import com.jarvis.app.ai.AiException
+          import com.jarvis.app.ai.ChatTurn
+          import com.jarvis.app.ai.GeminiProvider
+          import com.jarvis.app.data.SecureStore
+          import java.io.IOException
+
+          class MainActivity : Activity() {
+
+              private val bg = Color.parseColor("#07121F")
+              private val surface = Color.parseColor("#0D1F33")
+              private val bubbleBot = Color.parseColor("#12304A")
+              private val accent = Color.parseColor("#5FD0FF")
+              private val ink = Color.parseColor("#E6F2FB")
+              private val muted = Color.parseColor("#8AA4BA")
+
+              private lateinit var store: SecureStore
+              private lateinit var list: LinearLayout
+              private lateinit var scroll: ScrollView
+              private lateinit var input: EditText
+              private lateinit var status: TextView
+              private lateinit var sendBtn: Button
+
+              private val history = mutableListOf<ChatTurn>()
+              private var busy = false
+
+              private val systemPrompt =
+                  "Você é a JARVIS, assistente pessoal falando português do Brasil. " +
+                  "Seja calma, educada e objetiva, com respostas curtas. " +
+                  "Você ainda não controla aplicativos nem o celular: se pedirem uma ação, " +
+                  "diga com honestidade que isso ainda não está disponível. " +
+                  "Nunca diga que fez algo que não fez."
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun round(color: Int, radius: Int): GradientDrawable =
+                  GradientDrawable().apply {
+                      setColor(color)
+                      cornerRadius = dp(radius).toFloat()
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  store = SecureStore(this)
+                  window.statusBarColor = bg
+                  window.navigationBarColor = bg
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(bg)
+                  }
+
+                  val header = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(20), dp(12), dp(16), dp(4))
+                  }
+                  val title = TextView(this).apply {
+                      text = "JARVIS"
+                      textSize = 22f
+                      setTextColor(ink)
+                      typeface = Typeface.DEFAULT_BOLD
+                      letterSpacing = 0.12f
+                  }
+                  header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  val settingsBtn = Button(this).apply {
+                      text = "Ajustes"
+                      isAllCaps = false
+                      setTextColor(ink)
+                      background = round(bubbleBot, 22)
+                      minHeight = dp(44)
+                      minimumHeight = dp(44)
+                      setOnClickListener { showSettings() }
+                  }
+                  header.addView(settingsBtn)
+                  root.addView(header)
+
+                  status = TextView(this).apply {
+                      text = "Pronto."
+                      textSize = 13f
+                      setTextColor(muted)
+                      setPadding(dp(20), 0, dp(20), dp(4))
+                  }
+                  root.addView(status)
+
+                  list = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(4), dp(16), dp(12))
+                  }
+                  scroll = ScrollView(this).apply { addView(list) }
+                  root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  val bar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setBackgroundColor(surface)
+                      setPadding(dp(12), dp(10), dp(12), dp(10))
+                  }
+                  input = EditText(this).apply {
+                      hint = "Escreva uma mensagem"
+                      setHintTextColor(muted)
+                      setTextColor(ink)
+                      textSize = 16f
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                      imeOptions = EditorInfo.IME_ACTION_SEND
+                      background = round(bg, 22)
+                      setPadding(dp(16), dp(10), dp(16), dp(10))
+                      setOnEditorActionListener { _, actionId, _ ->
+                          if (actionId == EditorInfo.IME_ACTION_SEND) {
+                              send()
+                              true
+                          } else {
+                              false
+                          }
+                      }
+                  }
+                  bar.addView(input, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  sendBtn = Button(this).apply {
+                      text = "Enviar"
+                      isAllCaps = false
+                      setTextColor(bg)
+                      background = round(accent, 22)
+                      minHeight = dp(44)
+                      minimumHeight = dp(44)
+                      setOnClickListener { send() }
+                  }
+                  val sendParams = LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT
+                  ).apply { leftMargin = dp(8) }
+                  bar.addView(sendBtn, sendParams)
+                  root.addView(bar)
+
+                  setContentView(root)
+
+                  if (store.apiKey.isEmpty()) {
+                      addBubble("Olá. Sou a JARVIS. Para começar, toque em Ajustes e cole a sua chave de IA.", false)
+                  } else {
+                      addBubble("Olá. Estou pronta. Escreva uma mensagem.", false)
+                  }
+              }
+
+              private fun addBubble(text: String, fromUser: Boolean) {
+                  val tv = TextView(this).apply {
+                      this.text = text
+                      textSize = 15f
+                      setTextColor(if (fromUser) bg else ink)
+                      background = round(if (fromUser) accent else bubbleBot, 16)
+                      setPadding(dp(14), dp(10), dp(14), dp(10))
+                      maxWidth = (resources.displayMetrics.widthPixels * 0.82).toInt()
+                  }
+                  val params = LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT
+                  ).apply {
+                      gravity = if (fromUser) Gravity.END else Gravity.START
+                      topMargin = dp(8)
+                  }
+                  list.addView(tv, params)
+                  scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+              }
+
+              private fun send() {
+                  val text = input.text.toString().trim()
+                  if (text.isEmpty() || busy) return
+                  if (store.apiKey.isEmpty()) {
+                      addBubble("Falta a chave de IA. Toque em Ajustes e cole a chave.", false)
+                      showSettings()
+                      return
+                  }
+                  input.setText("")
+                  addBubble(text, true)
+                  history.add(ChatTurn(true, text))
+                  busy = true
+                  sendBtn.isEnabled = false
+                  status.text = "Pensando…"
+
+                  val snapshot = history.toList()
+                  val provider = GeminiProvider(store.apiKey, store.model, systemPrompt)
+                  Thread {
+                      val result = runCatching { provider.reply(snapshot) }
+                      runOnUiThread {
+                          result.onSuccess { answer ->
+                              history.add(ChatTurn(false, answer))
+                              addBubble(answer, false)
+                              status.text = "Pronto."
+                          }
+                          result.onFailure { error ->
+                              history.removeAt(history.size - 1)
+                              addBubble(friendly(error), false)
+                              status.text = "Sem resposta."
+                          }
+                          busy = false
+                          sendBtn.isEnabled = true
+                      }
+                  }.start()
+              }
+
+              private fun friendly(error: Throwable): String = when (error) {
+                  is AiException -> error.message ?: "Erro da IA."
+                  is IOException -> "Sem conexão com a internet. Verifique e tente de novo."
+                  else -> "Resposta inesperada da IA. Tente de novo."
+              }
+
+              private fun showSettings() {
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(12), dp(20), 0)
+                  }
+                  val keyField = EditText(this).apply {
+                      hint = if (store.apiKey.isEmpty()) "Cole a chave de IA" else "Chave salva (deixe vazio para manter)"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  }
+                  val modelField = EditText(this).apply {
+                      setText(store.model)
+                      hint = "Nome do modelo"
+                      inputType = InputType.TYPE_CLASS_TEXT
+                  }
+                  box.addView(keyField)
+                  box.addView(modelField)
+
+                  AlertDialog.Builder(this)
